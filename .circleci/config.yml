@@ -1,0 +1,215 @@
+version: 2.1
+
+# Executors for running jobs
+executors:
+  # Defines a Docker executor for Node.js applications
+  app-executor:
+    docker:
+      - image: cimg/node:18.0.0 # Docker image for node environment
+    working_directory: ~/app # Set the working directory
+
+  # Defines a Docker executor for Terraform tasks
+  terraform-executor:
+    docker:
+      - image: hashicorp/terraform:latest # Docker image for terraform environment
+
+aliases:
+  # Alias for installing dependencies
+  - &install-app-dependencies
+    run:
+      name: Install app dependencies
+      command: |
+        mkdir -p artifacts
+        yarn install
+
+  # Alias for building app in production mode
+  - &build-app
+    run:
+      name: Build app in production mode
+      command: |
+        yarn install
+        yarn build
+        echo "Prod build is successful!"
+
+  # Alias for configuring Terraform Cloud
+  # Reference: https://circleci.com/developer/orbs/orb/circleci/terraform
+  - &configure-terraform-cloud
+    run:
+      name: Configure Terraform Cloud via creating .terraformrc file
+      command: |
+        echo "credentials \"app.terraform.io\" {token =
+        \"$TERRAFORM_TOKEN\"}" > $HOME/.terraformrc
+
+  # Alias for saving cache
+  - &save-app-cache
+    save_cache:
+      paths:
+        - node_modules
+      key: app-{{ checksum "package.json" }} # Cache key based on package.json state
+
+  # Alias for restoring cache, used in multiple jobs
+  - &restore-app-cache
+    restore_cache:
+      keys:
+        - app-{{ checksum "package.json" }} # Cache key based on package.json state
+        - app- # Fallback cache key
+
+orbs:
+  aws-cli: circleci/aws-cli@3.1 # Imports the AWS CLI, clircleci orb
+
+jobs:
+  # Job for setting up the project and installing dependencies
+  setup:
+    executor: app-executor
+    steps:
+      - checkout # Checks out the source code
+      - *restore-app-cache # Restores cache, using the defined alias
+      - *install-app-dependencies # Installs application dependencies
+      - *save-app-cache # Saves the cache for future runs
+      - run:
+          name: Copy all tf scripts to artifacts folder
+          command: |
+            cp -r terraform artifacts/terraform/ # Copies Terraform scripts to the artifacts folder
+      - persist_to_workspace:
+          root: ./ # Sets the root for the workspace
+          paths:
+            - artifacts # Persists the 'artifacts' directory to the workspace for use in subsequent jobs
+
+  # Job for building the project
+  build:
+    executor: app-executor
+    steps:
+      - checkout # Checks out the code from the version control system
+      - attach_workspace: # Attaches the workspace from previous jobs
+          at: ./ # Specifies the path to attach the workspace
+      - *build-app # build the app in production mode
+
+  # Job for Terraform Validation
+  terraform-validate:
+    parameters:
+      env:
+        type: string
+    executor: terraform-executor
+    steps:
+      - checkout # Checks out the code from version control
+      - run:
+          name: Terraform Validate and Format
+          command: |
+            cd terraform/<< parameters.env >> # Changes directory to the 'terraform' directory followed by the environment specified in the 'env' parameter.
+            terraform init -backend=false # Initializes Terraform without a backend. This is often used for syntax checking or module installation without saving state.
+            terraform validate # Runs Terraform validate, which checks for syntax errors and other issues in the Terraform files.
+
+  terraform-plan-and-apply:
+    parameters:
+      env:
+        type: string
+    executor: terraform-executor
+    steps:
+      - checkout
+      - attach_workspace:
+          at: ./ # Attaches a workspace at the current directory.
+      - *configure-terraform-cloud
+      - run:
+          name: Terraform Plan
+          command: |
+            mkdir artifacts
+            cp -r terraform artifacts/terraform/ # Copies Terraform scripts to the dist folder
+            cd artifacts/terraform/<< parameters.env >>
+            terraform init
+            terraform plan
+      - run:
+          name: Terraform Apply
+          command: |
+            cd artifacts/terraform/<< parameters.env >>  # Navigates to the Terraform directory specific to the environment.
+            terraform apply --auto-approve # Applies the Terraform changes automatically without manual approval.
+            terraform output bucket_id > ../../<< parameters.env >>_bucket_id.txt # Saves the Terraform output for bucket_id to a file.
+            terraform output cloudfront_dist_id > ../../<< parameters.env >>_cloudfront_dist_id.txt # Saves the Terraform output for cloudfront_dist_id to a file.
+      - persist_to_workspace:
+          root: ./
+          paths:
+            - artifacts
+
+  deploy-to-aws-s3:
+    executor: app-executor
+    steps:
+      - checkout
+      - attach_workspace:
+          at: ./
+      - aws-cli/setup
+      - *build-app
+      - run:
+          name: Deploy to AWS S3 Bucket
+          command: |
+            AWS_BUCKET_NAME=$(cat artifacts/prod_bucket_id.txt | sed 's/\"//g') # Extracts the AWS S3 bucket name from a file, removing any quotes.
+            if [ "${CIRCLE_BRANCH}" == "main" ]
+            then 
+              aws --region ${AWS_REGION} s3 sync ~/app/dist s3://${AWS_BUCKET_NAME} --delete # Syncs the contents of the artifacts folder to the S3 bucket.
+            fi
+  deploy-to-aws-cloudfront:
+    executor: app-executor
+    steps:
+      - checkout
+      - attach_workspace:
+          at: ./
+      - aws-cli/setup
+      - *build-app
+      - run:
+          name: Deploy to AWS CloudFront Distribution
+          command: |
+            AWS_CLOUDFRONT_DISTRIBUTION_ID=$(cat artifacts/prod_cloudfront_dist_id.txt | sed 's/\"//g') # Extracts the AWS S3 bucket name from a file, removing any quotes.
+            aws configure set preview.cloudfront true
+            if [ "${CIRCLE_BRANCH}" == "main" ]  # Checks if the current branch is 'main'.
+            then 
+              aws cloudfront create-invalidation --distribution-id ${AWS_CLOUDFRONT_DISTRIBUTION_ID} --path /\*
+            fi
+
+workflows:
+  # Series of jobs that make up the build and deploy process.
+  build_and_deploy:
+    jobs:
+      # Sets up the environment, using the 'Web' context for shared environment variables and settings.
+      - setup:
+          context: Web
+      #  Build process of the application
+      - build:
+          context: Web
+      # Performs Terraform validation
+      - terraform-validate:
+          context: Web
+          name: terraform-validate
+          requires:
+            - build
+          env: prod
+          filters:
+            branches:
+              only:
+                - main
+      # Performs Terraform plan and apply
+      - terraform-plan-and-apply:
+          context: Web
+          name: terraform-plan-and-apply
+          requires:
+            - terraform-validate
+          env: prod
+          filters:
+            branches:
+              only:
+                - main
+      # Deploys the application to AWS S3
+      - deploy-to-aws-s3:
+          context: Web
+          requires:
+            - terraform-plan-and-apply
+          filters:
+            branches:
+              only:
+                - main
+      # Deploys the application to AWS CloudFront
+      - deploy-to-aws-cloudfront:
+          context: Web
+          requires:
+            - deploy-to-aws-s3
+          filters:
+            branches:
+              only:
+                - main
