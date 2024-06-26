@@ -1,3 +1,11 @@
+# Project Overview
+Task was to design and implement a website composed solely of static files and images, leveraging IaaS-provided binary file storage like AWS S3 or Azure Blob Storage. The key requirement was to deploy all website-related files via a CI/CD process and integrate the website with a content delivery system to enhance performance. We achieved this using a React application, CircleCI for CI/CD, Terraform for infrastructure automation, and AWS services for cloud hosting.
+
+# Solution Architecture
+
+![image](https://github.com/Sachin-Mamoru/devops-ci-iac/assets/59449070/7c04ba9a-0e44-4b2e-9de8-f87d3beb47ad)
+
+
 # React + TypeScript + Vite
 
 This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
